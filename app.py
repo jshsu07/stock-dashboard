@@ -1,8 +1,10 @@
 """
-股票技術指標監控儀表板 v3.0
-- 登入：輸入名字 → URL 含 ?u=名字 → 書籤此頁 → 下次免登入
-- 美股 + 台股同頁顯示
-- 技術建議欄位（RSI + KD 組合訊號）
+股票技術指標監控儀表板 v4.0
+- 隱藏 Streamlit 系統 UI（選單、頁尾、頁眉）
+- 自選股改為 ticker + 🗑️ 垃圾桶刪除
+- 台股輸入純數字自動補 .TW
+- 台股名稱改繁體中文（TWSE API + 備用對照表）
+- 技術建議說明表格放在頁面最下方
 """
 
 import streamlit as st
@@ -22,7 +24,13 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+    /* 隱藏 Streamlit 系統 UI */
+    #MainMenu  { visibility: hidden; }
+    footer     { visibility: hidden; }
+    header     { visibility: hidden; }
+
     .stApp { font-family: 'Segoe UI', 'Microsoft JhengHei', Arial, sans-serif; }
+
     .gradient-title {
         font-size: 2rem; font-weight: 800;
         background: linear-gradient(135deg, #0066cc 0%, #00aa44 100%);
@@ -33,8 +41,10 @@ st.markdown("""
         background: #f0f4f8; border-radius: 8px; padding: 0.6rem 1rem;
         font-size: 0.82rem; margin-top: 0.8rem; border-left: 4px solid #0066cc;
     }
-    .section-header {
-        font-size: 1.2rem; font-weight: 700; margin: 0.5rem 0;
+    /* 垃圾桶按鈕縮小 */
+    div[data-testid="stButton"] button[title^="移除"] {
+        padding: 0.15rem 0.4rem;
+        font-size: 0.85rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -49,9 +59,79 @@ RSI_PERIOD        = 14
 KD_K_PERIOD, KD_K_SMOOTH, KD_D_SMOOTH = 14, 3, 3
 HISTORY_PERIOD    = "6mo"
 
+# 台股繁體中文名稱備用對照表（TWSE API 無法取得時使用）
+_TW_NAMES_FALLBACK = {
+    # ETF
+    "0050": "元大台灣50",      "0056": "元大高股息",
+    "006208": "富邦台50",      "00878": "國泰永續高股息",
+    "00919": "群益台灣精選高息","00929": "復華台灣科技優息",
+    "00940": "元大台灣價值高息","00900": "富邦特選高股息30",
+    "00713": "元大台灣高息低波","00850": "元大臺灣ESG永續",
+    "00881": "國泰台灣5G+",    "00892": "富邦台灣半導體",
+    # 上市大型股
+    "2330": "台積電",  "2317": "鴻海",    "2454": "聯發科",
+    "2382": "廣達",    "2308": "台達電",   "2303": "聯電",
+    "3711": "日月光投控","2327": "國巨",   "2344": "華邦電",
+    "3034": "聯詠",    "2395": "研華",     "2379": "瑞昱",
+    "2408": "南亞科",  "2357": "華碩",     "2353": "宏碁",
+    "2376": "技嘉",    "2377": "微星",     "2409": "友達",
+    "3481": "群創",    "2356": "英業達",   "2382": "廣達",
+    "2474": "可成",    "2360": "致茂",
+    "2603": "長榮",    "2609": "陽明",     "2615": "萬海",
+    "2618": "長榮航",  "2633": "台灣高鐵",
+    "2412": "中華電信","4904": "遠傳",     "3045": "台灣大",
+    "2002": "中鋼",    "1301": "台塑",     "1303": "南亞",
+    "1326": "台化",    "6505": "台塑化",   "1216": "統一",
+    "2912": "統一超",  "2207": "和泰車",   "9910": "豐泰",
+    "3008": "大立光",  "5871": "中租-KY",
+    "1101": "台泥",    "1102": "亞泥",
+    # 金控
+    "2881": "富邦金",  "2882": "國泰金",  "2886": "兆豐金",
+    "2891": "中信金",  "2884": "玉山金",  "2892": "第一金",
+    "2880": "華南金",  "2885": "元大金",  "2883": "開發金",
+    "2887": "台新金",  "2890": "永豐金",  "5880": "合庫金",
+    "2801": "彰銀",
+    # 上櫃常見
+    "3661": "世芯-KY", "6415": "矽力-KY", "3443": "創意",
+    "5274": "信驊",    "6669": "緯穎",    "3406": "玉晶光",
+    "8046": "南電",    "3533": "嘉澤",    "3105": "穩懋",
+    "6271": "同欣電",  "3037": "欣興",    "4966": "譜瑞-KY",
+}
+
 
 # ════════════════════════════════════════════════════
-# 2. Supabase 資料庫
+# 2. 台股繁體中文名稱查詢（TWSE API + 備用表）
+# ════════════════════════════════════════════════════
+@st.cache_data(ttl=86400, show_spinner=False)
+def _get_tw_name_map() -> dict:
+    """
+    從台灣證交所 OpenAPI 取得全部上市股票繁體中文名稱。
+    每 24 小時更新一次，失敗時使用備用對照表。
+    """
+    import requests
+    names = dict(_TW_NAMES_FALLBACK)   # 先載入備用表
+    try:
+        r = requests.get(
+            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+            timeout=8,
+        )
+        for item in r.json():
+            code = str(item.get("Code", "")).strip()
+            name = str(item.get("Name", "")).strip()
+            if code and name:
+                names[code] = name
+    except Exception:
+        pass
+    return names
+
+
+def _tw_chinese_name(code: str, fallback: str) -> str:
+    """查詢台股繁體中文名稱，找不到回傳 fallback（英文名或代號）"""
+    return _get_tw_name_map().get(code, fallback)
+
+
+# ════════════════════════════════════════════════════
+# 3. Supabase 資料庫
 # ════════════════════════════════════════════════════
 @st.cache_resource
 def _get_supabase():
@@ -90,16 +170,9 @@ def _save_watchlist():
 
 
 # ════════════════════════════════════════════════════
-# 3. 登入系統（URL 書籤方式）
-#
-# 運作原理：
-#   登入後 URL 變成 ?u=你的名字
-#   把這個完整網址存成書籤
-#   下次點書籤 → URL 帶有 ?u= → 自動登入，不需要再輸入
-#   換電腦：輸入名字一次 → 再存書籤即可
+# 4. 登入系統（URL ?u= 書籤方式）
 # ════════════════════════════════════════════════════
 def _check_url_login():
-    """從 URL 的 ?u= 參數自動登入（書籤方式）"""
     if "username" in st.session_state:
         return
     name = st.query_params.get("u", "").strip()
@@ -120,7 +193,7 @@ def _do_login(name: str) -> bool:
     st.session_state.us_watchlist = us
     st.session_state.tw_watchlist = tw
     st.session_state.last_refresh = datetime.now()
-    st.query_params["u"] = name   # 將名字寫入 URL，讓使用者可以書籤存起來
+    st.query_params["u"] = name
     return True
 
 
@@ -133,7 +206,6 @@ def _do_logout():
 
 
 def render_login_screen():
-    """登入頁面：輸入名字即可進入"""
     _, col, _ = st.columns([1, 1.2, 1])
     with col:
         st.markdown("""
@@ -144,12 +216,7 @@ def render_login_screen():
             </div>
         </div>
         """, unsafe_allow_html=True)
-
-        name = st.text_input(
-            "name",
-            placeholder="輸入你的名字",
-            label_visibility="collapsed",
-        )
+        name = st.text_input("name", placeholder="輸入你的名字", label_visibility="collapsed")
         if st.button("進入 →", type="primary", use_container_width=True):
             if _do_login(name):
                 st.session_state._show_bookmark_hint = True
@@ -159,10 +226,9 @@ def render_login_screen():
 
 
 # ════════════════════════════════════════════════════
-# 4. 技術指標計算
+# 5. 技術指標計算
 # ════════════════════════════════════════════════════
 def calculate_rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
-    """RSI — Wilder's Smoothing Method"""
     delta    = close.diff()
     gain     = delta.clip(lower=0)
     loss     = (-delta).clip(lower=0)
@@ -174,7 +240,6 @@ def calculate_rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
 
 def calculate_kd(high, low, close,
                  k_period=KD_K_PERIOD, k_smooth=KD_K_SMOOTH, d_smooth=KD_D_SMOOTH):
-    """慢速 KD(14,3,3)"""
     lowest   = low.rolling(k_period).min()
     highest  = high.rolling(k_period).max()
     hl_range = (highest - lowest).replace(0, np.nan)
@@ -185,38 +250,21 @@ def calculate_kd(high, low, close,
 
 
 # ════════════════════════════════════════════════════
-# 5. 技術建議函數
+# 6. 技術建議
 # ════════════════════════════════════════════════════
 def _get_signal(rsi: float, k: float, d: float,
                 kd_golden_cross: bool, kd_dead_cross: bool) -> str:
-    """
-    根據 RSI 和 KD 組合給出技術分析建議，優先順序由強到弱：
-
-    強力買進：RSI < 30 且 KD 低檔黃金交叉（雙重超賣確認）
-    強力賣出：RSI > 70 且 KD 高檔死亡交叉（雙重超買確認）
-    考慮買進：RSI < 30 或 KD 低檔黃金交叉（單一超賣訊號）
-    考慮賣出：RSI > 70 或 KD 高檔死亡交叉（單一超買訊號）
-    偏低留意：RSI 在 30~45 且 KD 低於 40（相對低檔但未到超賣）
-    偏高留意：RSI 在 55~70 且 KD 高於 60（相對高檔但未到超買）
-    中性觀望：其餘情況
-    """
-    if rsi < 30 and kd_golden_cross:
-        return "🔥 強力買進"
-    if rsi > 70 and kd_dead_cross:
-        return "🔴 強力賣出"
-    if rsi < 30 or kd_golden_cross:
-        return "🟢 考慮買進"
-    if rsi > 70 or kd_dead_cross:
-        return "🟠 考慮賣出"
-    if rsi < 45 and k < 40:
-        return "🔵 偏低留意"
-    if rsi > 55 and k > 60:
-        return "🟡 偏高留意"
+    if rsi < 30 and kd_golden_cross:    return "🔥 強力買進"
+    if rsi > 70 and kd_dead_cross:      return "🔴 強力賣出"
+    if rsi < 30 or kd_golden_cross:     return "🟢 考慮買進"
+    if rsi > 70 or kd_dead_cross:       return "🟠 考慮賣出"
+    if rsi < 45 and k < 40:             return "🔵 偏低留意"
+    if rsi > 55 and k > 60:             return "🟡 偏高留意"
     return "⚪ 中性觀望"
 
 
 # ════════════════════════════════════════════════════
-# 6. 數據獲取（快取 5 分鐘）
+# 7. 數據獲取（快取 5 分鐘）
 # ════════════════════════════════════════════════════
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_stock_data(ticker: str) -> dict:
@@ -236,16 +284,23 @@ def fetch_stock_data(ticker: str) -> dict:
         prev_close   = float(hist["Close"].iloc[-2])
         change_pct   = (latest_close - prev_close) / prev_close * 100
 
+        # 英文名（yfinance 回傳）
         try:
             info = stock.info
-            name = (info.get("longName") or info.get("shortName") or ticker)[:25]
+            yf_name = (info.get("longName") or info.get("shortName") or ticker)[:30]
         except Exception:
-            name = ticker
+            yf_name = ticker
 
-        # KD 黃金交叉（低檔 K 上穿 D）
-        kd_golden_cross = False
-        # KD 死亡交叉（高檔 K 下穿 D）
-        kd_dead_cross   = False
+        # 台股改繁體中文名稱
+        is_tw = ticker.endswith(".TW") or ticker.endswith(".TWO")
+        if is_tw:
+            code = ticker.split(".")[0]
+            name = _tw_chinese_name(code, yf_name)
+        else:
+            name = yf_name
+
+        # KD 訊號偵測
+        kd_golden_cross = kd_dead_cross = False
         k_clean, d_clean = k_s.dropna(), d_s.dropna()
         if len(k_clean) >= 2 and len(d_clean) >= 2:
             k_prev, k_now = float(k_clean.iloc[-2]), float(k_clean.iloc[-1])
@@ -267,45 +322,39 @@ def fetch_stock_data(ticker: str) -> dict:
 
 
 # ════════════════════════════════════════════════════
-# 7. 表格樣式
+# 8. 表格樣式
 # ════════════════════════════════════════════════════
 def _style_rsi(s):
-    out = []
-    for v in s:
-        if pd.isna(v):  out.append("")
-        elif v < 30:    out.append("background-color:#c6efce;color:#276221;font-weight:700")
-        elif v > 70:    out.append("background-color:#ffc7ce;color:#9c0006;font-weight:700")
-        else:           out.append("")
-    return out
+    return [
+        "background-color:#c6efce;color:#276221;font-weight:700" if v < 30
+        else "background-color:#ffc7ce;color:#9c0006;font-weight:700" if v > 70
+        else "" for v in s
+    ]
 
 def _style_kd(s):
-    out = []
-    for v in s:
-        if pd.isna(v):  out.append("")
-        elif v < 20:    out.append("background-color:#e2efda;color:#375623")
-        elif v > 80:    out.append("background-color:#fce4d6;color:#833c0b")
-        else:           out.append("")
-    return out
+    return [
+        "background-color:#e2efda;color:#375623" if v < 20
+        else "background-color:#fce4d6;color:#833c0b" if v > 80
+        else "" for v in s
+    ]
 
 def _style_change(s):
-    out = []
-    for v in s:
-        if pd.isna(v):  out.append("")
-        elif v > 0:     out.append("color:#c00000;font-weight:700")
-        elif v < 0:     out.append("color:#375623;font-weight:700")
-        else:           out.append("color:gray")
-    return out
+    return [
+        "color:#c00000;font-weight:700" if v > 0
+        else "color:#375623;font-weight:700" if v < 0
+        else "color:gray" for v in s
+    ]
 
 def _style_signal(s):
     out = []
     for v in s:
         v = str(v)
-        if "強力買進" in v:   out.append("background-color:#00897b;color:white;font-weight:700")
-        elif "考慮買進" in v:  out.append("background-color:#c6efce;color:#1b5e20;font-weight:700")
-        elif "強力賣出" in v:  out.append("background-color:#c62828;color:white;font-weight:700")
-        elif "考慮賣出" in v:  out.append("background-color:#ffc7ce;color:#7f0000;font-weight:700")
-        elif "偏低留意" in v:  out.append("background-color:#e3f2fd;color:#0d47a1")
-        elif "偏高留意" in v:  out.append("background-color:#fff8e1;color:#e65100")
+        if   "強力買進" in v: out.append("background-color:#00897b;color:white;font-weight:700")
+        elif "考慮買進" in v: out.append("background-color:#c6efce;color:#1b5e20;font-weight:700")
+        elif "強力賣出" in v: out.append("background-color:#c62828;color:white;font-weight:700")
+        elif "考慮賣出" in v: out.append("background-color:#ffc7ce;color:#7f0000;font-weight:700")
+        elif "偏低留意" in v: out.append("background-color:#e3f2fd;color:#0d47a1")
+        elif "偏高留意" in v: out.append("background-color:#fff8e1;color:#e65100")
         else:                  out.append("")
     return out
 
@@ -328,9 +377,23 @@ def build_styled_df(df: pd.DataFrame):
 
 
 # ════════════════════════════════════════════════════
-# 8. 自選股管理 UI
+# 9. 自選股管理 UI
+#    - 台股：純數字自動補 .TW
+#    - 刪除：垃圾桶 🗑️ 在代號右側，不另起一排
 # ════════════════════════════════════════════════════
-def render_watchlist_manager(watchlist_key: str, placeholder: str):
+def _normalize_ticker(raw: str, is_tw: bool) -> str:
+    """台股輸入純數字時自動補 .TW 後綴"""
+    raw = raw.strip().upper()
+    if not is_tw:
+        return raw
+    if raw.endswith(".TW") or raw.endswith(".TWO"):
+        return raw
+    if raw.isdigit():
+        return f"{raw}.TW"
+    return raw
+
+
+def render_watchlist_manager(watchlist_key: str, placeholder: str, is_tw: bool = False):
     col_inp, col_add, col_reset = st.columns([3, 1, 1])
     with col_inp:
         new_ticker = st.text_input(
@@ -339,7 +402,7 @@ def render_watchlist_manager(watchlist_key: str, placeholder: str):
         )
     with col_add:
         if st.button("➕ 新增", key=f"add_{watchlist_key}", use_container_width=True):
-            ticker = str(new_ticker).strip().upper()
+            ticker = _normalize_ticker(new_ticker, is_tw)
             if not ticker:
                 st.toast("請先輸入股票代號", icon="⚠️")
             elif ticker in st.session_state[watchlist_key]:
@@ -357,22 +420,34 @@ def render_watchlist_manager(watchlist_key: str, placeholder: str):
             st.cache_data.clear()
             st.rerun()
 
+    # ── 自選股標籤（代號 + 🗑️ 同列）──────────────
     watchlist = st.session_state[watchlist_key]
-    if watchlist:
-        cols = st.columns(min(len(watchlist), 8))
-        for i, tkr in enumerate(list(watchlist)):
-            with cols[i % 8]:
-                if st.button(f"✕ {tkr}", key=f"del_{watchlist_key}_{tkr}", use_container_width=True):
+    if not watchlist:
+        st.caption("清單為空，請新增股票代號")
+        return
+
+    ITEMS_PER_ROW = 6
+    for start in range(0, len(watchlist), ITEMS_PER_ROW):
+        batch = watchlist[start:start + ITEMS_PER_ROW]
+        # 每個 ticker 佔 [ticker欄, 垃圾桶欄] = [2.5, 0.4]
+        ratios = sum([[2.5, 0.4] for _ in batch], [])
+        cols   = st.columns(ratios)
+        for j, tkr in enumerate(batch):
+            with cols[j * 2]:
+                st.markdown(
+                    f"<div style='padding-top:6px; font-weight:600;'>{tkr}</div>",
+                    unsafe_allow_html=True,
+                )
+            with cols[j * 2 + 1]:
+                if st.button("🗑️", key=f"del_{watchlist_key}_{tkr}", help=f"移除 {tkr}"):
                     st.session_state[watchlist_key].remove(tkr)
                     _save_watchlist()
                     st.cache_data.clear()
                     st.rerun()
-    else:
-        st.caption("清單為空，請新增股票代號")
 
 
 # ════════════════════════════════════════════════════
-# 9. 股票資料表格
+# 10. 股票資料表格
 # ════════════════════════════════════════════════════
 def render_stock_table(watchlist: list):
     if not watchlist:
@@ -430,33 +505,48 @@ def render_stock_table(watchlist: list):
     )
     st.markdown("""
     <div class="legend-row">
-        <b>顏色圖例：</b>&ensp;
+        <b>RSI / KD 顏色：</b>&ensp;
         <span style='background:#c6efce;color:#276221;padding:2px 7px;border-radius:4px;font-weight:700'>RSI &lt; 30</span> 超賣&ensp;
         <span style='background:#ffc7ce;color:#9c0006;padding:2px 7px;border-radius:4px;font-weight:700'>RSI &gt; 70</span> 超買&ensp;
         <span style='background:#e2efda;color:#375623;padding:2px 7px;border-radius:4px'>KD &lt; 20</span> 低檔&ensp;
-        <span style='background:#fce4d6;color:#833c0b;padding:2px 7px;border-radius:4px'>KD &gt; 80</span> 高檔&nbsp;｜&nbsp;
-        <b>技術建議：</b>
-        <span style='background:#00897b;color:white;padding:2px 7px;border-radius:4px'>🔥 強力買進</span>&ensp;
-        <span style='background:#c6efce;color:#1b5e20;padding:2px 7px;border-radius:4px'>🟢 考慮買進</span>&ensp;
-        <span style='background:#c62828;color:white;padding:2px 7px;border-radius:4px'>🔴 強力賣出</span>&ensp;
-        <span style='background:#ffc7ce;color:#7f0000;padding:2px 7px;border-radius:4px'>🟠 考慮賣出</span>
+        <span style='background:#fce4d6;color:#833c0b;padding:2px 7px;border-radius:4px'>KD &gt; 80</span> 高檔
     </div>
     """, unsafe_allow_html=True)
 
 
 # ════════════════════════════════════════════════════
-# 10. 主程式
+# 11. 技術建議說明（頁面最下方）
+# ════════════════════════════════════════════════════
+def render_signal_legend():
+    st.markdown("---")
+    st.markdown("#### 📖 技術建議說明")
+    st.markdown("""
+| 訊號 | 觸發條件 |
+|:----:|---------|
+| 🔥 強力買進 | RSI < 30 **且** KD 在 20 以下黃金交叉（K 由下往上穿越 D） |
+| 🟢 考慮買進 | RSI < 30 **或** KD 在 20 以下黃金交叉（單一訊號） |
+| 🔴 強力賣出 | RSI > 70 **且** KD 在 80 以上死亡交叉（K 由上往下穿越 D） |
+| 🟠 考慮賣出 | RSI > 70 **或** KD 在 80 以上死亡交叉（單一訊號） |
+| 🔵 偏低留意 | RSI 介於 30～45 且 K 值 < 40（相對低檔，尚未超賣） |
+| 🟡 偏高留意 | RSI 介於 55～70 且 K 值 > 60（相對高檔，尚未超買） |
+| ⚪ 中性觀望 | 以上條件均不符合 |
+
+> **RSI（相對強弱指標）**：衡量近期漲跌幅強弱，14 日為標準週期。
+> **KD（隨機指標）**：K 值反映收盤位置在近期高低區間的相對強度，D 值為 K 值平均線。
+> ⚠️ 技術指標僅供輔助參考，不構成投資建議，投資人應自行判斷。
+""")
+
+
+# ════════════════════════════════════════════════════
+# 12. 主程式
 # ════════════════════════════════════════════════════
 def main():
-    # 嘗試從 URL ?u= 自動登入
     _check_url_login()
 
-    # 未登入 → 顯示登入畫面
     if "username" not in st.session_state:
         render_login_screen()
         st.stop()
 
-    # 第一次登入後提示書籤
     if st.session_state.pop("_show_bookmark_hint", False):
         st.toast("✅ 登入成功！請將目前網址加入書籤，下次點擊直接進入", icon="📎")
 
@@ -484,18 +574,20 @@ def main():
 
     # ── 美股 ──────────────────────────────────────
     st.markdown("### 🇺🇸 美股")
-    render_watchlist_manager("us_watchlist", "輸入美股代號，例如：AAPL、MSFT、SPY")
+    render_watchlist_manager("us_watchlist", "輸入美股代號，例如：AAPL、MSFT", is_tw=False)
     render_stock_table(st.session_state.us_watchlist)
 
     st.divider()
 
     # ── 台股 ──────────────────────────────────────
     st.markdown("### 🇹🇼 台股")
-    st.info("💡 上市加 `.TW`（如 `2330.TW`）；上櫃加 `.TWO`（如 `3661.TWO`）")
-    render_watchlist_manager("tw_watchlist", "輸入台股代號，例如：2330.TW、0056.TW")
+    st.info("💡 直接輸入股票代號數字即可（如 `2330`），系統自動補 `.TW`；上櫃股請手動加 `.TWO`（如 `3661.TWO`）")
+    render_watchlist_manager("tw_watchlist", "輸入台股代號，例如：2330、0056", is_tw=True)
     render_stock_table(st.session_state.tw_watchlist)
 
-    st.divider()
+    # ── 技術建議說明（頁尾）─────────────────────
+    render_signal_legend()
+
     st.caption("⚠️ 免責聲明：本儀表板提供之數據與技術指標僅供輔助分析，不構成任何投資建議。投資有風險，請審慎評估，自負盈虧。")
 
 
