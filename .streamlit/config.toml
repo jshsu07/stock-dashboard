@@ -1,0 +1,9 @@
+[theme]
+primaryColor     = "#0066cc"
+backgroundColor  = "#ffffff"
+secondaryBackgroundColor = "#f0f4f8"
+textColor        = "#1e2a3a"
+font             = "sans serif"
+
+[server]
+headless = true          # 雲端部署時必須設為 true
