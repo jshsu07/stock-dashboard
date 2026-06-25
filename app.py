@@ -538,6 +538,9 @@ def render_chart_section(watchlist: list, watchlist_key: str):
         df["MA5"]  = df["Close"].rolling(5).mean()
         df["MA20"] = df["Close"].rolling(20).mean()
 
+        # 用日期字串當 x 軸標籤，搭配 type='category' 自動排除所有非交易日空白
+        dates = df.index.strftime("%Y-%m-%d")
+
         vol_colors = [
             "#26a69a" if float(c) >= float(o) else "#ef5350"
             for c, o in zip(df["Close"], df["Open"])
@@ -551,7 +554,7 @@ def render_chart_section(watchlist: list, watchlist_key: str):
         )
 
         fig.add_trace(go.Candlestick(
-            x=df.index,
+            x=dates,
             open=df["Open"], high=df["High"],
             low=df["Low"],   close=df["Close"],
             increasing_line_color="#26a69a", increasing_fillcolor="#26a69a",
@@ -560,17 +563,17 @@ def render_chart_section(watchlist: list, watchlist_key: str):
         ), row=1, col=1)
 
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["MA5"],
+            x=dates, y=df["MA5"],
             name="MA5", line=dict(color="#ff9800", width=1.3),
         ), row=1, col=1)
 
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["MA20"],
+            x=dates, y=df["MA20"],
             name="MA20", line=dict(color="#2196f3", width=1.3),
         ), row=1, col=1)
 
         fig.add_trace(go.Bar(
-            x=df.index, y=df["Volume"],
+            x=dates, y=df["Volume"],
             marker_color=vol_colors,
             showlegend=False, name="成交量",
         ), row=2, col=1)
@@ -598,7 +601,8 @@ def render_chart_section(watchlist: list, watchlist_key: str):
             xaxis2=dict(gridcolor="#eeeeee", showgrid=True),
         )
 
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+        # type='category'：只顯示有資料的交易日，週末與所有假日的間距自動消失
+        fig.update_xaxes(type="category", tickangle=-45, nticks=10)
 
         st.plotly_chart(fig, use_container_width=True)
 
