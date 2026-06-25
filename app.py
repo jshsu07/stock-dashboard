@@ -242,12 +242,17 @@ def _get_signal(rsi: float, k: float, d: float,
 # 7. 數據獲取（快取 5 分鐘）
 # ════════════════════════════════════════════════════
 def _fmt_change(v) -> str:
-    """漲跌幅格式化，含 None / NaN 防護"""
+    """漲跌幅格式化，含 None / NaN 防護；🔴 漲 / 🟢 跌（台股慣例）"""
     try:
         f = float(v)
         if np.isnan(f):
             return "-"
-        return f"▲ {f:.2f}%" if f > 0 else f"▼ {abs(f):.2f}%" if f < 0 else "0.00%"
+        if f > 0:
+            return f"🔴 ▲{f:.2f}%"
+        elif f < 0:
+            return f"🟢 ▼{abs(f):.2f}%"
+        else:
+            return "⚪ 0.00%"
     except (TypeError, ValueError):
         return "-"
 
