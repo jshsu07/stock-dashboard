@@ -228,13 +228,29 @@ def calculate_kd(high, low, close,
 # 6. 技術建議
 # ════════════════════════════════════════════════════
 def _get_signal(rsi: float, k: float, d: float,
-                kd_golden_cross: bool, kd_dead_cross: bool) -> str:
-    if rsi < 30 and kd_golden_cross:    return "🔥 強力買進"
-    if rsi > 70 and kd_dead_cross:      return "🔴 強力賣出"
-    if rsi < 30 or kd_golden_cross:     return "🟢 考慮買進"
-    if rsi > 70 or kd_dead_cross:       return "🟠 考慮賣出"
-    if rsi < 45 and k < 40:             return "🔵 偏低留意"
-    if rsi > 55 and k > 60:             return "🟡 偏高留意"
+                kd_golden_cross_mid: bool,
+                kd_golden_cross_any: bool,
+                kd_dead_cross_high: bool) -> str:
+    """
+    右側順勢突破策略訊號（優先順序由強到弱）
+
+    強勢過熱：RSI > 75 且 KD 高檔（>80）死亡交叉 → 果斷分批獲利
+    注意利潤：RSI > 70 或 KD 高檔死亡交叉 → 調整停損，防守持股
+    強勢發動：RSI 48~55 且 KD 在 30~60 黃金交叉 → 主升段最佳起漲買點
+    突破試單：RSI > 50 或 KD 黃金交叉（單一訊號）→ 試單建立部位
+    潛在打底：RSI 35~45 且 K、D 均 < 35 → 醞釀期，列入觀察名單
+    中性觀望：以上條件均不符合
+    """
+    if rsi > 75 and kd_dead_cross_high:
+        return "🔔 強勢過熱"
+    if rsi > 70 or kd_dead_cross_high:
+        return "🟠 注意利潤"
+    if 48 <= rsi <= 55 and kd_golden_cross_mid:
+        return "🔥 強勢發動"
+    if rsi > 50 or kd_golden_cross_any:
+        return "🟢 突破試單"
+    if 35 <= rsi <= 45 and k < 35 and d < 35:
+        return "🔵 潛在打底"
     return "⚪ 中性觀望"
 
 
@@ -242,15 +258,15 @@ def _get_signal(rsi: float, k: float, d: float,
 # 7. 數據獲取（快取 5 分鐘）
 # ════════════════════════════════════════════════════
 def _fmt_change(v) -> str:
-    """漲跌幅格式化，含 None / NaN 防護；🔴 漲 / 🟢 跌（台股慣例）"""
+    """漲跌幅格式化，含 None / NaN 防護；🟢 漲 / 🔴 跌（美股慣例）"""
     try:
         f = float(v)
         if np.isnan(f):
             return "-"
         if f > 0:
-            return f"🔴 ▲{f:.2f}%"
+            return f"🟢 ▲{f:.2f}%"
         elif f < 0:
-            return f"🟢 ▼{abs(f):.2f}%"
+            return f"🔴 ▼{abs(f):.2f}%"
         else:
             return "⚪ 0.00%"
     except (TypeError, ValueError):
@@ -301,22 +317,28 @@ def fetch_stock_data(ticker: str) -> dict:
         is_tw = ticker.endswith(".TW") or ticker.endswith(".TWO")
         name  = _tw_chinese_name(ticker.split(".")[0], yf_name) if is_tw else yf_name
 
-        kd_golden_cross = kd_dead_cross = False
+        kd_golden_cross_any = kd_golden_cross_mid = kd_dead_cross_high = False
         k_clean, d_clean = k_s.dropna(), d_s.dropna()
         if len(k_clean) >= 2 and len(d_clean) >= 2:
             k_prev, k_now = float(k_clean.iloc[-2]), float(k_clean.iloc[-1])
             d_prev, d_now = float(d_clean.iloc[-2]), float(d_clean.iloc[-1])
-            if k_prev < d_prev and k_now >= d_now and k_now < 20 and d_now < 20:
-                kd_golden_cross = True
+            # 黃金交叉：K 由下往上穿越 D
+            if k_prev < d_prev and k_now >= d_now:
+                kd_golden_cross_any = True
+                # 中段黃金交叉（30~60）→ 強勢發動訊號
+                if 30 <= k_now <= 60 and 30 <= d_now <= 60:
+                    kd_golden_cross_mid = True
+            # 高檔死亡交叉：K 由上往下穿越 D，且 K、D 均 > 80
             if k_prev > d_prev and k_now <= d_now and k_now > 80 and d_now > 80:
-                kd_dead_cross = True
+                kd_dead_cross_high = True
 
         return {
             "ticker": ticker, "name": name,
             "close": latest_close, "change_pct": change_pct,
             "rsi": latest_rsi, "k": latest_k, "d": latest_d,
-            "kd_golden_cross": kd_golden_cross,
-            "kd_dead_cross":   kd_dead_cross,
+            "kd_golden_cross_any": kd_golden_cross_any,
+            "kd_golden_cross_mid": kd_golden_cross_mid,
+            "kd_dead_cross_high":  kd_dead_cross_high,
         }
     except Exception as e:
         return {"ticker": ticker, "error": str(e)}
@@ -393,7 +415,9 @@ def render_stock_table(watchlist: list, watchlist_key: str):
                 "D值":        round(result["d"], 1),
                 "技術建議":   _get_signal(
                     result["rsi"], result["k"], result["d"],
-                    result["kd_golden_cross"], result["kd_dead_cross"],
+                    result["kd_golden_cross_mid"],
+                    result["kd_golden_cross_any"],
+                    result["kd_dead_cross_high"],
                 ),
                 "🗑️": False,
             })
@@ -469,21 +493,20 @@ def render_stock_table(watchlist: list, watchlist_key: str):
 # ════════════════════════════════════════════════════
 def render_signal_legend():
     st.markdown("---")
-    st.markdown("#### 📖 技術建議說明")
+    st.markdown("#### 📖 技術建議說明（右側順勢突破策略）")
     st.markdown("""
-| 訊號 | 觸發條件 |
-|:----:|---------|
-| 🔥 強力買進 | RSI < 30 **且** KD 在 20 以下黃金交叉（K 由下往上穿越 D） |
-| 🟢 考慮買進 | RSI < 30 **或** KD 在 20 以下黃金交叉（單一訊號） |
-| 🔴 強力賣出 | RSI > 70 **且** KD 在 80 以上死亡交叉（K 由上往下穿越 D） |
-| 🟠 考慮賣出 | RSI > 70 **或** KD 在 80 以上死亡交叉（單一訊號） |
-| 🔵 偏低留意 | RSI 介於 30～45 且 K 值 < 40（相對低檔，尚未超賣） |
-| 🟡 偏高留意 | RSI 介於 55～70 且 K 值 > 60（相對高檔，尚未超買） |
-| ⚪ 中性觀望 | 以上條件均不符合 |
+| 訊號 | 觸發條件 | 策略實務意義 |
+|:----:|---------|------------|
+| 🔥 強勢發動 | RSI **48～55** 且 KD 在 **30～60** 之間黃金交叉 | 最完美的「主升段起漲點」。代表股價拉回整理結束，多方成功奪回主導權，動能同時點火，屬於高勝率的效率買點。 |
+| 🟢 突破試單 | RSI > 50 **或** KD 剛完成黃金交叉（單一訊號） | 趨勢已開始向多頭傾斜，但兩大指標尚未完全共振。適合先建立基本部位（試單），等待另一個指標到位再加碼。 |
+| 🔔 強勢過熱 | RSI > 75 **且** KD 在 80 以上出現死亡交叉 | 股價進入極度瘋狂的超買區，且短線過熱動能已開始失速。右側交易者應在此時果斷分批獲利入袋。 |
+| 🟠 注意利潤 | RSI > 70 **或** KD 在 80 以上死亡交叉（單一訊號） | 股價已進入高檔區，隨時可能面臨震盪。此時不宜追高，應開始調整移動停損點（防守性持股）。 |
+| 🔵 潛在打底 | RSI **35～45** 且 KD 正在低檔打底（K、D 均 < 35） | 股價正在進行修正或橫盤。這通常是「下一波起漲前的醞釀期」，列入觀察名單。 |
+| ⚪ 中性觀望 | 以上條件均不符合 | 市場目前沒有明顯趨勢，可能處於洗盤或盤整期，資金應保留實力，不盲目出手。 |
 
-> **RSI**（相對強弱指標）：衡量近期漲跌幅強弱，14 日週期。
-> **KD**（隨機指標）：K 值反映收盤在近期高低區間的位置，D 值為 K 的平均線。
-> ⚠️ 技術指標僅供輔助參考，不構成投資建議。
+> **RSI**（相對強弱指標）：14 日週期，衡量近期漲跌幅強弱。
+> **KD**（隨機指標）：14,3,3 設定。K 值反映收盤在近期高低區間的位置，D 值為 K 的平均線。
+> ⚠️ 技術指標僅供輔助參考，不構成投資建議，請自行判斷風險。
 """)
 
 
