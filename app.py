@@ -9,6 +9,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime
 
 # ════════════════════════════════════════════════════
@@ -43,7 +45,7 @@ DEFAULT_US_STOCKS = ["NVDA", "TSLA", "QQQ", "MU", "AVGO"]
 DEFAULT_TW_STOCKS = ["2330.TW", "0050.TW"]
 RSI_PERIOD = 14
 KD_K_PERIOD, KD_K_SMOOTH, KD_D_SMOOTH = 14, 3, 3
-HISTORY_PERIOD = "6mo"
+HISTORY_PERIOD = "1y"
 
 _TW_NAMES_FALLBACK = {
     "0050": "元大台灣50",       "0056": "元大高股息",
@@ -332,6 +334,12 @@ def fetch_stock_data(ticker: str) -> dict:
             if k_prev > d_prev and k_now <= d_now and k_now > 80 and d_now > 80:
                 kd_dead_cross_high = True
 
+        # OHLC 資料（K 線圖用，跟指標共用同一次 API 請求，無額外消耗）
+        ohlc = hist[["Open", "High", "Low", "Close", "Volume"]].copy()
+        if ohlc.index.tz is not None:
+            ohlc.index = ohlc.index.tz_convert(None)
+        ohlc = ohlc.dropna(subset=["Open", "High", "Low", "Close"])
+
         return {
             "ticker": ticker, "name": name,
             "close": latest_close, "change_pct": change_pct,
@@ -339,6 +347,7 @@ def fetch_stock_data(ticker: str) -> dict:
             "kd_golden_cross_any": kd_golden_cross_any,
             "kd_golden_cross_mid": kd_golden_cross_mid,
             "kd_dead_cross_high":  kd_dead_cross_high,
+            "ohlc": ohlc,
         }
     except Exception as e:
         return {"ticker": ticker, "error": str(e)}
@@ -489,7 +498,113 @@ def render_stock_table(watchlist: list, watchlist_key: str):
 
 
 # ════════════════════════════════════════════════════
-# 10. 技術建議說明（頁面最下方）
+# 10. K 線走勢圖（點擊展開，可切換股票與區間）
+# ════════════════════════════════════════════════════
+def render_chart_section(watchlist: list, watchlist_key: str):
+    if not watchlist:
+        return
+
+    with st.expander("📊 K 線走勢圖", expanded=False):
+        col_sel, col_range = st.columns([2, 3])
+        with col_sel:
+            selected = st.selectbox(
+                "股票",
+                options=watchlist,
+                key=f"chart_sel_{watchlist_key}",
+                label_visibility="collapsed",
+            )
+        with col_range:
+            period_label = st.radio(
+                "區間",
+                options=["30 天", "3 個月", "1 年"],
+                horizontal=True,
+                key=f"chart_period_{watchlist_key}",
+                label_visibility="collapsed",
+            )
+
+        n_days = {"30 天": 30, "3 個月": 90, "1 年": 365}[period_label]
+
+        result = fetch_stock_data(selected)
+        if "error" in result or result.get("ohlc") is None:
+            st.warning(f"無法取得 {selected} 的走勢圖資料")
+            return
+
+        df = result["ohlc"].tail(n_days).copy()
+        if len(df) < 5:
+            st.warning("資料筆數不足，無法顯示走勢圖")
+            return
+
+        name = result.get("name", selected)
+        df["MA5"]  = df["Close"].rolling(5).mean()
+        df["MA20"] = df["Close"].rolling(20).mean()
+
+        vol_colors = [
+            "#26a69a" if float(c) >= float(o) else "#ef5350"
+            for c, o in zip(df["Close"], df["Open"])
+        ]
+
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.04,
+            row_heights=[0.75, 0.25],
+        )
+
+        fig.add_trace(go.Candlestick(
+            x=df.index,
+            open=df["Open"], high=df["High"],
+            low=df["Low"],   close=df["Close"],
+            increasing_line_color="#26a69a", increasing_fillcolor="#26a69a",
+            decreasing_line_color="#ef5350", decreasing_fillcolor="#ef5350",
+            showlegend=False, name=selected,
+        ), row=1, col=1)
+
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["MA5"],
+            name="MA5", line=dict(color="#ff9800", width=1.3),
+        ), row=1, col=1)
+
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["MA20"],
+            name="MA20", line=dict(color="#2196f3", width=1.3),
+        ), row=1, col=1)
+
+        fig.add_trace(go.Bar(
+            x=df.index, y=df["Volume"],
+            marker_color=vol_colors,
+            showlegend=False, name="成交量",
+        ), row=2, col=1)
+
+        fig.update_layout(
+            title=dict(
+                text=f"<b>{selected}</b>　{name}",
+                font=dict(size=14, color="#1e2a3a"),
+                x=0, xanchor="left",
+            ),
+            height=430,
+            margin=dict(l=0, r=10, t=45, b=0),
+            xaxis_rangeslider_visible=False,
+            plot_bgcolor="#fafafa",
+            paper_bgcolor="white",
+            legend=dict(
+                orientation="h", x=0.01, y=1.05,
+                font=dict(size=11), bgcolor="rgba(0,0,0,0)",
+            ),
+            yaxis=dict(
+                gridcolor="#eeeeee", side="right",
+                showgrid=True, tickformat=".2f",
+            ),
+            yaxis2=dict(gridcolor="#eeeeee", side="right", showgrid=False),
+            xaxis2=dict(gridcolor="#eeeeee", showgrid=True),
+        )
+
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# ════════════════════════════════════════════════════
+# 11. 技術建議說明（頁面最下方）
 # ════════════════════════════════════════════════════
 def render_signal_legend():
     st.markdown("---")
@@ -546,6 +661,7 @@ def main():
     st.markdown("### 🇺🇸 美股")
     render_watchlist_manager("us_watchlist", "輸入美股代號，例如：AAPL、MSFT", is_tw=False)
     render_stock_table(st.session_state.us_watchlist, "us_watchlist")
+    render_chart_section(st.session_state.us_watchlist, "us_watchlist")
 
     st.divider()
 
@@ -553,6 +669,7 @@ def main():
     st.info("💡 直接輸入數字即可（如 `2330`），系統自動補 `.TW`；上櫃股請手動加 `.TWO`（如 `3661.TWO`）")
     render_watchlist_manager("tw_watchlist", "輸入台股代號，例如：2330、0056", is_tw=True)
     render_stock_table(st.session_state.tw_watchlist, "tw_watchlist")
+    render_chart_section(st.session_state.tw_watchlist, "tw_watchlist")
 
     render_signal_legend()
     st.caption("⚠️ 免責聲明：本儀表板提供之數據與技術指標僅供輔助分析，不構成任何投資建議。投資有風險，請審慎評估，自負盈虧。")
